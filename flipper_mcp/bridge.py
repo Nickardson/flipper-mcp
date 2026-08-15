@@ -29,6 +29,7 @@ import time
 from typing import Optional
 
 import serial
+from serial.tools import list_ports
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[=>]|\x1b\][^\x07]*\x07")
 PROMPT = ">:"
@@ -90,6 +91,23 @@ class FlipperBridge:
             candidates = sorted(glob.glob("/dev/cu.usbmodemflip_*"))
         elif sysname == "Linux":
             candidates = sorted(glob.glob("/dev/serial/by-id/*Flipper*"))
+        elif sysname == "Windows":
+            # Windows: Flipper enumerates as a generic "USB Serial Device"
+            # (STMicro VCP driver) — the description gives us nothing useful.
+            # Match on the actual VID:PID (0483:5740, STMicro's VCP ID that
+            # Flipper uses) or the "FLIP_" prefix Flipper puts in its USB
+            # serial number, e.g. hwid="USB VID:PID=0483:5740 SER=FLIP_AN9A1ITE ...".
+            candidates = []
+            for port_info in list_ports.comports():
+                hwid = (port_info.hwid or "").upper()
+                desc = (port_info.description or "").lower()
+                if (
+                    "VID:PID=0483:5740" in hwid
+                    or "SER=FLIP_" in hwid
+                    or "flipper" in desc
+                ):
+                    candidates.append(port_info.device)
+            candidates = sorted(candidates)
         else:
             candidates = []
         if not candidates:
