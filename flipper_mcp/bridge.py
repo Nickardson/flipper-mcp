@@ -14,6 +14,14 @@ Design notes:
   - Reads happen on a background thread that appends to a shared bytearray
     under a lock. This avoids blocking the main thread and lets us peek at
     buffer size for the quiet-period check.
+  - A bridge outlives the connection it was built on. The Flipper re-enumerates
+    on USB whenever it reboots, is replugged, or switches in and out of
+    protobuf RPC mode, which leaves the open handle stale: on Windows every
+    subsequent write fails with ERROR_BAD_COMMAND, on POSIX with ENXIO/EIO.
+    Since the MCP server caches one bridge for its whole lifetime, a stale
+    handle would otherwise brick every tool until the server restarted. Writes
+    that begin an operation therefore reconnect and retry once — see
+    ``reconnect``.
 """
 
 from __future__ import annotations
@@ -53,12 +61,28 @@ class FlipperBridge:
         baudrate: int = 115200,
         read_timeout: float = 0.05,
     ) -> None:
-        self.port = port or self._auto_detect()
+        # Remember whether the port was pinned by the caller. On reconnect an
+        # auto-detected port has to be detected again — Windows hands out a
+        # different COM number when the device re-enumerates.
+        self._pinned_port = port
+        self._baudrate = baudrate
+        self._read_timeout = read_timeout
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._reader: Optional[threading.Thread] = None
+        self._open()
+
+    # -- connection ---------------------------------------------------------
+
+    def _open(self) -> None:
+        """Detect, open, and hand the port to a fresh reader thread."""
+        self.port = self._pinned_port or self._auto_detect()
         try:
             self._ser = serial.Serial(
                 self.port,
-                baudrate=baudrate,
-                timeout=read_timeout,
+                baudrate=self._baudrate,
+                timeout=self._read_timeout,
                 write_timeout=2.0,
             )
         except serial.SerialException as e:
@@ -73,14 +97,42 @@ class FlipperBridge:
                     "session. Close it and retry."
                 ) from e
             raise FlipperError(f"Could not open {self.port}: {e}") from e
-        self._buf = bytearray()
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._stop.clear()
+        self._drain()
         self._reader = threading.Thread(
             target=self._read_loop, name="flipper-reader", daemon=True
         )
         self._reader.start()
         self._handshake()
+
+    def _teardown(self) -> None:
+        """Stop the reader and drop the handle. Safe on an already-dead port."""
+        self._stop.set()
+        reader, self._reader = self._reader, None
+        if reader is not None and reader is not threading.current_thread():
+            # The read loop blocks for at most `read_timeout`, so this returns
+            # promptly. Joining matters: two reader threads appending to the
+            # same buffer would interleave old and new bytes.
+            reader.join(timeout=2.0)
+        try:
+            # getattr, not attribute access: a bridge whose very first _open()
+            # failed before binding the handle still has to tear down cleanly.
+            port = getattr(self, "_ser", None)
+            if port is not None:
+                port.close()
+        except Exception:
+            pass
+
+    def reconnect(self) -> None:
+        """Rebuild the connection after the device re-enumerated.
+
+        Anything buffered belonged to the old connection and is discarded, so
+        this is only safe between operations — never mid-command, and never
+        inside an RPC session, where it would drop the CLI back in front of a
+        caller still speaking protobuf.
+        """
+        self._teardown()
+        self._open()
 
     # -- discovery ----------------------------------------------------------
 
@@ -124,9 +176,14 @@ class FlipperBridge:
         while not self._stop.is_set():
             try:
                 data = self._ser.read(4096)
-            except serial.SerialException:
-                break
-            except OSError:
+            except Exception:
+                # Deliberately broad. A port that dies mid-read raises whatever
+                # the platform backend happens to raise — pyserial's Windows
+                # reader trips over its own torn-down OVERLAPPED struct and
+                # throws TypeError, not SerialException. Any of them mean the
+                # same thing: this connection is finished. Exit quietly and let
+                # the next write notice the dead thread and reconnect, rather
+                # than dumping a traceback into the MCP server's stderr.
                 break
             if data:
                 with self._lock:
@@ -147,10 +204,54 @@ class FlipperBridge:
             return len(self._buf)
 
     # -- writing ------------------------------------------------------------
+    #
+    # `allow_reconnect` is opt-in per call site rather than automatic, because
+    # a reconnect is only harmless on the *first* write of an operation. Retry
+    # a later write in a sequence and the bytes land on a device that never saw
+    # the opening command — `write_file` would spill a file's contents onto the
+    # CLI as commands, and an RPC request would arrive at a device back in text
+    # mode. First writes carry no such history, so those are the ones marked.
 
-    def _write(self, payload: str) -> None:
-        self._ser.write(payload.encode("utf-8"))
-        self._ser.flush()
+    def _raw_write(self, data: bytes, allow_reconnect: bool) -> None:
+        # A dead reader thread means the port failed on the read side — it
+        # exits its loop on error and never comes back. Writes can still
+        # succeed against such a handle, which would strand the caller waiting
+        # on a quiet period that no longer has anyone filling the buffer, so
+        # check before writing rather than after.
+        if allow_reconnect and self._reader is not None and not self._reader.is_alive():
+            self.reconnect()
+        try:
+            self._ser.write(data)
+            self._ser.flush()
+        except Exception as e:
+            # Broad for the same reason as `_read_loop`: pyserial reports a
+            # dead handle as SerialException on most paths and as TypeError
+            # from the Windows backend. Narrowing to SerialException would let
+            # precisely the Windows case escape unhealed.
+            if not allow_reconnect:
+                raise FlipperError(
+                    f"Lost the connection to the Flipper on {self.port} "
+                    f"mid-command: {e}. The command may have half-executed; "
+                    "retry it once the device is back."
+                ) from e
+            try:
+                self.reconnect()
+            except FlipperError as reconnect_error:
+                raise FlipperError(
+                    f"Lost the connection to the Flipper on {self.port} ({e}) "
+                    f"and could not reconnect: {reconnect_error}"
+                ) from e
+            try:
+                self._ser.write(data)
+                self._ser.flush()
+            except Exception as retry_error:
+                raise FlipperError(
+                    f"Reconnected to the Flipper on {self.port} but the write "
+                    f"still failed: {retry_error}"
+                ) from retry_error
+
+    def _write(self, payload: str, allow_reconnect: bool = False) -> None:
+        self._raw_write(payload.encode("utf-8"), allow_reconnect)
 
     # -- waiting ------------------------------------------------------------
 
@@ -205,11 +306,7 @@ class FlipperBridge:
         self._drain()
 
     def close(self) -> None:
-        self._stop.set()
-        try:
-            self._ser.close()
-        except Exception:
-            pass
+        self._teardown()
 
     def __enter__(self) -> "FlipperBridge":
         return self
@@ -222,7 +319,7 @@ class FlipperBridge:
     def send(self, cmd: str, timeout: float = 10.0, quiet_ms: int = 300) -> str:
         """Run a one-shot command, return cleaned output once it settles."""
         self._drain()
-        self._write(cmd + "\r\n")
+        self._write(cmd + "\r\n", allow_reconnect=True)
         self._wait_quiet(timeout, quiet_ms)
         return self._clean(self._snapshot(), cmd)
 
@@ -235,7 +332,7 @@ class FlipperBridge:
     ) -> str:
         """Run a streaming command for `duration` seconds, Ctrl-C, return output."""
         self._drain()
-        self._write(cmd + "\r\n")
+        self._write(cmd + "\r\n", allow_reconnect=True)
         time.sleep(duration)
         self._write("\x03")  # Ctrl-C
         self._wait_quiet(post_timeout, quiet_ms)
@@ -250,7 +347,7 @@ class FlipperBridge:
         closing out.
         """
         self._drain()
-        self._write("\x03")
+        self._write("\x03", allow_reconnect=True)
         self._wait_quiet(timeout=2.0, quiet_ms=200)
         return self._clean(self._snapshot())
 
@@ -260,10 +357,14 @@ class FlipperBridge:
     # it needs the buffer untouched — no ANSI stripping, no CRLF rewriting,
     # no prompt trimming. These three are the whole escape hatch.
 
-    def write_raw(self, data: bytes) -> None:
-        """Write raw bytes verbatim — no encoding, no line terminator."""
-        self._ser.write(data)
-        self._ser.flush()
+    def write_raw(self, data: bytes, allow_reconnect: bool = False) -> None:
+        """Write raw bytes verbatim — no encoding, no line terminator.
+
+        Defaults to no reconnect: mid-session RPC requests must fail loudly
+        rather than resurface on a device that has been reset back to the CLI.
+        Only the write that opens a session may set ``allow_reconnect``.
+        """
+        self._raw_write(data, allow_reconnect)
 
     def take_raw(self) -> bytes:
         """Pop everything buffered so far, unprocessed."""
@@ -275,7 +376,7 @@ class FlipperBridge:
 
     def resync(self, timeout: float = 2.0) -> None:
         """Return the CLI to a known state after raw/binary traffic."""
-        self._write("\r\n")
+        self._write("\r\n", allow_reconnect=True)
         self._wait_quiet(timeout, quiet_ms=200)
         self._drain()
 
@@ -291,7 +392,7 @@ class FlipperBridge:
         text files only — not suitable for binary payloads or large files.
         """
         self._drain()
-        self._write(f"storage write {path}\r\n")
+        self._write(f"storage write {path}\r\n", allow_reconnect=True)
         # Give the Flipper a moment to open the file and start reading
         time.sleep(0.3)
         self._write(content)

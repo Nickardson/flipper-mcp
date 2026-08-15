@@ -179,7 +179,7 @@ class FakeBridge:
     def send(self, cmd: str, timeout: float = 10.0, quiet_ms: int = 300) -> str:
         return "app: Desktop" if cmd == "loader info" else ""
 
-    def write_raw(self, data: bytes) -> None:
+    def write_raw(self, data: bytes, allow_reconnect: bool = False) -> None:
         self.written.extend(data)
         payloads, _ = rpc.split_messages(bytes(data))
         for payload in payloads:

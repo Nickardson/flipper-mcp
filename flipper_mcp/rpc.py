@@ -209,7 +209,11 @@ def rpc_session(
     # the terminator, so a trailing newline would land in the binary stream,
     # where 0x0A reads as "next message is 10 bytes long" and eats the head of
     # the first real request. This costs an afternoon if you get it wrong.
-    bridge.write_raw(b"start_rpc_session\r")
+    # This is the one write in the session that may reconnect: nothing has been
+    # sent yet, so a handle left stale by an earlier reboot or replug can be
+    # rebuilt here without corrupting anything. Every later write is a protobuf
+    # request that only means something to a device already in RPC mode.
+    bridge.write_raw(b"start_rpc_session\r", allow_reconnect=True)
     # The CLI echoes the command and emits its last prompt before the switch.
     _settle(bridge)
     channel = RpcChannel(bridge)
