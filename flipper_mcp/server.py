@@ -17,7 +17,7 @@ import atexit
 import os
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .bridge import FlipperBridge
 from .registry import (
@@ -41,7 +41,7 @@ from .ui import (
     subghz_read_start_ui,
 )
 
-mcp = FastMCP("flipper")
+mcp = MCPServer("flipper")
 
 # Per-user default radio device for SubGHz commands.
 #   0 = internal CC1101 (default for everyone without an add-on)
