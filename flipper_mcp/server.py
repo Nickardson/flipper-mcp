@@ -533,15 +533,19 @@ def flipper_input_sequence(sequence: str, step_delay_s: float = 0.05) -> list[st
 
 @mcp.tool(structured_output=False)
 def flipper_screen(scale: int = 4, timeout_s: float = 3.0) -> list:
-    """Capture the Flipper's 128x64 screen as a PNG, plus a state envelope.
+    """Capture the Flipper's screen as a PNG, plus a state envelope.
 
     Use this to verify the device actually reached the UI state you drove it
     to with ``flipper_press_key`` / ``flipper_input_sequence``.
 
     Returns two blocks:
-      - the screen as an image, upscaled by ``scale`` (default 4 = 512x256)
+      - the screen as an image, upscaled by ``scale`` (default 4)
       - JSON with ``app`` (foreground app per ``loader info``), ``orientation``,
-        and two digests.
+        the image's ``width``/``height``, and two digests.
+
+    The panel is 128x64, but an app running in a vertical orientation is
+    rotated upright for you and comes back 64x128. Take the dimensions from
+    the envelope rather than assuming landscape.
 
     On the digests: assert on ``body_sha256``, which covers the rows below the
     status bar. ``frame_sha256`` includes the clock and battery indicators, so

@@ -154,7 +154,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ### Screen capture (v0.6)
 | Tool | Purpose |
 |---|---|
-| `flipper_screen(scale, timeout_s)` | Capture the 128x64 screen as a PNG plus a state envelope |
+| `flipper_screen(scale, timeout_s)` | Capture the screen as a PNG plus a state envelope (128x64, or 64x128 for vertical apps) |
 
 The Flipper CLI has no screenshot command, so this tool briefly switches the
 device into protobuf RPC mode (the same channel
@@ -179,6 +179,17 @@ Alongside the image you get a JSON envelope:
 covers the whole screen including the clock, battery and Bluetooth icons, which
 change on their own schedule. Assert on the former, use the latter only as a
 "did anything move?" signal.
+
+**Vertical apps are rotated for you.** The device always transmits the raw
+128x64 panel, whatever orientation the running app asked for, so a vertical
+app's frame arrives lying on its side. It is turned clockwise into a 64x128
+portrait image before encoding — verified against the Infrared editor on
+`mntm-012`. `width` and `height` describe the *image*, so read your expected
+dimensions off the envelope rather than assuming 128x64.
+
+One wrinkle: vertical apps appear to draw no status bar, so the 13-row crop
+costs `body_sha256` a little real content there. That is the deliberate
+direction to be wrong — the digest's whole contract is that it holds still.
 
 **Digests only identify screens that hold still.** Verified on Momentum
 `mntm-012`: two captures of a settled screen are byte-identical, but the app

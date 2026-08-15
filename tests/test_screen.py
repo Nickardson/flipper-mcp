@@ -109,8 +109,8 @@ def test_unpack_matches_reference_renderer(x: int, y: int) -> None:
 
 
 def test_unpack_rotates_180_for_flipped_orientation() -> None:
-    normal = screen.unpack(FRAME, 0)
-    flipped = screen.unpack(FRAME, 1)
+    normal = screen.unpack(FRAME, screen.HORIZONTAL)
+    flipped = screen.unpack(FRAME, screen.HORIZONTAL_FLIP)
     assert flipped[63][127] == normal[0][0]
     assert flipped[0][0] == normal[63][127]
 
@@ -118,6 +118,63 @@ def test_unpack_rotates_180_for_flipped_orientation() -> None:
 def test_unpack_rejects_short_frame() -> None:
     with pytest.raises(FlipperError, match="Short framebuffer"):
         screen.unpack(FRAME[:512])
+
+
+# -- rotation --------------------------------------------------------------
+#
+# The device transmits the raw 128x64 panel whatever orientation the running
+# app asked for, so a vertical app's frame arrives on its side and this module
+# has to turn it. Getting the direction wrong is not a crash — it produces a
+# perfectly valid image that reads upside down.
+
+
+@pytest.mark.parametrize(
+    "orientation", [screen.VERTICAL, screen.VERTICAL_FLIP]
+)
+def test_vertical_frames_become_portrait(orientation: int) -> None:
+    rows = screen.unpack(FRAME, orientation)
+    assert len(rows) == screen.WIDTH, "expected 128 rows tall"
+    assert len(rows[0]) == screen.HEIGHT, "expected 64 columns wide"
+
+
+def test_vertical_turns_clockwise() -> None:
+    """Pinned against hardware: clockwise is the direction that reads upright.
+
+    Tracking the panel's top-left corner is enough to fix the direction — a
+    quarter turn clockwise sends it to the top-right.
+    """
+    landscape = screen.unpack(FRAME, screen.HORIZONTAL)
+    portrait = screen.unpack(FRAME, screen.VERTICAL)
+
+    top_left, top_right = landscape[0][0], landscape[0][127]
+    bottom_left = landscape[63][0]
+    assert portrait[0][63] == top_left
+    assert portrait[127][63] == top_right
+    assert portrait[0][0] == bottom_left
+
+
+def test_vertical_flip_is_vertical_turned_180() -> None:
+    """The same relationship HORIZONTAL_FLIP has to HORIZONTAL."""
+    portrait = screen.unpack(FRAME, screen.VERTICAL)
+    flipped = screen.unpack(FRAME, screen.VERTICAL_FLIP)
+    assert flipped == [list(reversed(row)) for row in reversed(portrait)]
+
+
+def test_rotation_preserves_every_pixel() -> None:
+    """A turn moves ink about; it must not create or destroy any."""
+    landscape = screen.unpack(FRAME, screen.HORIZONTAL)
+    ink = sum(sum(row) for row in landscape)
+    for orientation in (screen.HORIZONTAL_FLIP, screen.VERTICAL, screen.VERTICAL_FLIP):
+        rows = screen.unpack(FRAME, orientation)
+        assert sum(sum(row) for row in rows) == ink
+
+
+def test_four_quarter_turns_return_to_the_start() -> None:
+    rows = screen.unpack(FRAME, screen.HORIZONTAL)
+    turned = rows
+    for _ in range(4):
+        turned = screen._rotate_cw(turned)
+    assert turned == rows
 
 
 # -- PNG -------------------------------------------------------------------
@@ -139,6 +196,21 @@ def test_png_is_structurally_valid() -> None:
         kinds.append(kind.decode())
         pos += 12 + length
     assert kinds == ["IHDR", "IDAT", "IEND"]
+
+
+def test_png_takes_its_dimensions_from_the_rows() -> None:
+    """A portrait frame must not be written with the panel's landscape header.
+
+    The IHDR is where a wrong assumption here surfaces: a header that disagrees
+    with the pixel data produces a file no decoder can read.
+    """
+    png = screen.to_png(screen.unpack(FRAME, screen.VERTICAL), scale=4)
+    width, height = struct.unpack(">II", png[16:24])
+    assert (width, height) == (256, 512)
+
+    length = struct.unpack(">I", png[33:37])[0]
+    raw = zlib.decompress(png[41 : 41 + length])
+    assert len(raw) == height * (width + 1), "pixel data does not match the header"
 
 
 def test_png_pixels_are_black_ink_on_white() -> None:
@@ -232,6 +304,30 @@ def test_capture_returns_png_and_envelope() -> None:
     assert envelope["scale"] == 2
     assert envelope["text"] is None
     rows = screen.unpack(FRAME)
+    assert envelope["frame_sha256"] == hashlib.sha256(screen.pack_rows(rows)).hexdigest()
+    assert (
+        envelope["body_sha256"]
+        == hashlib.sha256(
+            screen.pack_rows(rows[screen.STATUS_BAR_ROWS :])
+        ).hexdigest()
+    )
+
+
+def test_capture_reports_the_image_size_not_the_panel_size() -> None:
+    """A vertical capture is 64x128 — callers size their view off this."""
+    bridge = FakeBridge(orientation=screen.VERTICAL)
+    envelope = screen.capture(bridge, scale=1)["envelope"]
+
+    assert envelope["orientation"] == "vertical"
+    assert (envelope["width"], envelope["height"]) == (screen.HEIGHT, screen.WIDTH)
+
+
+def test_capture_digests_the_rotated_image() -> None:
+    """The crop means "the top of what you see", so it follows the rotation."""
+    bridge = FakeBridge(orientation=screen.VERTICAL)
+    envelope = screen.capture(bridge, scale=1)["envelope"]
+
+    rows = screen.unpack(FRAME, screen.VERTICAL)
     assert envelope["frame_sha256"] == hashlib.sha256(screen.pack_rows(rows)).hexdigest()
     assert (
         envelope["body_sha256"]

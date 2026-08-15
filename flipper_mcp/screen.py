@@ -7,6 +7,11 @@ frontend/src/shared/lib/flipperJs/frameRenderer.ts): 1024 bytes covering
     byte  = data[(y >> 3) * 128 + x]
     pixel = byte & (1 << (y & 7))        set bit = ink
 
+The wire format is always that 128x64 panel, whatever orientation the running
+app asked for. An app in a vertical orientation therefore arrives lying on its
+side and is rotated here into a 64x128 portrait image. Nothing downstream may
+assume the image is 128x64 — read the shape off the rows.
+
 The status bar carries the clock, battery level, Bluetooth state and the SD
 icon, all of which change on their own schedule regardless of what app is in
 front. Hashing the whole frame therefore produces an identity that goes stale
@@ -46,16 +51,55 @@ FRAME_BYTES = WIDTH * HEIGHT // 8
 # Taken from the firmware's canvas status-bar height; a desktop capture puts
 # the bar's lower edge in this neighbourhood. Erring one row large is the safe
 # direction — it drops a row of app content rather than letting the clock in.
+#
+# The crop is applied to the image as displayed, after any rotation, so it
+# stays "the top of what you see" in every orientation. Vertical apps appear
+# to draw no status bar at all — the Infrared editor this was checked against
+# has none — so for those the crop costs 13 rows of real content for nothing.
+# That is the right way to be wrong: the digest's contract is that it holds
+# still, and 115 remaining rows identify a screen perfectly well.
 STATUS_BAR_ROWS = 13
 
 INK = 0x00  # black
 PAPER = 0xFF  # white — max contrast beats reproducing the orange backlight
 
-ORIENTATIONS = {0: "horizontal", 1: "horizontal_flip", 2: "vertical", 3: "vertical_flip"}
+HORIZONTAL = 0
+HORIZONTAL_FLIP = 1
+VERTICAL = 2
+VERTICAL_FLIP = 3
+
+ORIENTATIONS = {
+    HORIZONTAL: "horizontal",
+    HORIZONTAL_FLIP: "horizontal_flip",
+    VERTICAL: "vertical",
+    VERTICAL_FLIP: "vertical_flip",
+}
 
 
-def unpack(data: bytes, orientation: int = 0) -> list[list[bool]]:
-    """Expand the packed framebuffer into [y][x] booleans, ink = True."""
+def _rotate_cw(rows: list[list[bool]]) -> list[list[bool]]:
+    """Quarter turn clockwise. 128x64 landscape becomes 64x128 portrait."""
+    height, width = len(rows), len(rows[0])
+    return [[rows[height - 1 - x][y] for x in range(height)] for y in range(width)]
+
+
+def _flip180(rows: list[list[bool]]) -> list[list[bool]]:
+    return [list(reversed(row)) for row in reversed(rows)]
+
+
+def unpack(data: bytes, orientation: int = HORIZONTAL) -> list[list[bool]]:
+    """Expand the packed framebuffer into [y][x] booleans, ink = True.
+
+    The device always transmits the raw 128x64 panel, so a vertical app's
+    frame arrives lying on its side and has to be turned here — the rotation
+    is the client's job, not the firmware's. Rows come back 64 wide and 128
+    tall for the two vertical orientations, so callers must read the shape off
+    the returned rows rather than assuming WIDTH x HEIGHT.
+
+    Which way to turn was settled against a device: a vertical frame rotated
+    clockwise reads upright, and counter-clockwise comes out upside down.
+    VERTICAL_FLIP is the 180-degree counterpart of VERTICAL, exactly as
+    HORIZONTAL_FLIP is of HORIZONTAL.
+    """
     if len(data) < FRAME_BYTES:
         raise FlipperError(
             f"Short framebuffer: got {len(data)} bytes, expected {FRAME_BYTES}."
@@ -64,8 +108,12 @@ def unpack(data: bytes, orientation: int = 0) -> list[list[bool]]:
         [bool(data[(y >> 3) * WIDTH + x] & (1 << (y & 7))) for x in range(WIDTH)]
         for y in range(HEIGHT)
     ]
-    if orientation == 1:  # 180 degrees; matches the web app's only rotation case
-        rows = [list(reversed(row)) for row in reversed(rows)]
+    if orientation == HORIZONTAL_FLIP:
+        return _flip180(rows)
+    if orientation == VERTICAL:
+        return _rotate_cw(rows)
+    if orientation == VERTICAL_FLIP:
+        return _flip180(_rotate_cw(rows))
     return rows
 
 
@@ -88,8 +136,13 @@ def pack_rows(rows: list[list[bool]]) -> bytes:
 
 
 def to_png(rows: list[list[bool]], scale: int = 4) -> bytes:
-    """Encode [y][x] booleans as an 8-bit grayscale PNG, nearest-neighbour."""
-    width, height = WIDTH * scale, HEIGHT * scale
+    """Encode [y][x] booleans as an 8-bit grayscale PNG, nearest-neighbour.
+
+    Dimensions come from `rows`, not from WIDTH/HEIGHT: a frame captured in a
+    vertical orientation has been rotated to portrait by then, so the constants
+    describe the device's panel rather than the image being written.
+    """
+    width, height = len(rows[0]) * scale, len(rows) * scale
     raw = bytearray()
     for row in rows:
         line = bytearray()
@@ -148,8 +201,9 @@ def capture(bridge: FlipperBridge, scale: int = 4, timeout: float = 3.0) -> dict
         "png": to_png(rows, scale=scale),
         "envelope": {
             "app": app,
-            "width": WIDTH,
-            "height": HEIGHT,
+            # The image, not the panel: a vertical frame is 64x128 by here.
+            "width": len(rows[0]),
+            "height": len(rows),
             "scale": scale,
             "orientation": ORIENTATIONS.get(orientation, str(orientation)),
             "body_sha256": hashlib.sha256(pack_rows(rows[STATUS_BAR_ROWS:])).hexdigest(),
