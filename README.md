@@ -151,6 +151,49 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | `ir_universal_list(category)` | List built-in universal-remote buttons (tv/audio/ac/fan) |
 | `ir_universal_send(category, button)` | Transmit a universal-remote button from the firmware's DB |
 
+### Screen capture (v0.6)
+| Tool | Purpose |
+|---|---|
+| `flipper_screen(scale, timeout_s)` | Capture the 128x64 screen as a PNG plus a state envelope |
+
+The Flipper CLI has no screenshot command, so this tool briefly switches the
+device into protobuf RPC mode (the same channel
+[lab.flipper.net](https://lab.flipper.net) uses), pulls one frame, and switches
+back. **No other tool can talk to the device while that session is open** — it
+is always closed before the tool returns, including on error.
+
+Alongside the image you get a JSON envelope:
+
+```json
+{
+  "app": "Desktop",
+  "width": 128, "height": 64, "scale": 4,
+  "orientation": "horizontal",
+  "body_sha256": "…",
+  "frame_sha256": "…",
+  "text": null
+}
+```
+
+**`body_sha256`** covers the pixel rows below the status bar; `frame_sha256`
+covers the whole screen including the clock, battery and Bluetooth icons, which
+change on their own schedule. Assert on the former, use the latter only as a
+"did anything move?" signal.
+
+**Digests only identify screens that hold still.** Verified on Momentum
+`mntm-012`: two captures of a settled screen are byte-identical, but the app
+grid marquee-scrolls the label of the *selected* tile and animates its icon, so
+those frames differ every capture. For animated screens the image is the
+reliable check — read it, don't hash it. A settle-and-retry helper would close
+this gap if it turns out to matter in practice.
+
+The status-bar crop is row-exact (`STATUS_BAR_ROWS`, 13) rather than aligned to
+the 8-row byte pages, because a desktop capture shows the bar extending past
+row 8 — a page-aligned crop left the bottom of the clock digits inside the
+"stable" digest, where it would have changed every minute.
+
+`text` is reserved for bitmap-font OCR.
+
 ### Physical
 | Tool | Purpose |
 |---|---|

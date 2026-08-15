@@ -254,6 +254,31 @@ class FlipperBridge:
         self._wait_quiet(timeout=2.0, quiet_ms=200)
         return self._clean(self._snapshot())
 
+    # -- raw binary access --------------------------------------------------
+    #
+    # The protobuf RPC mode (see rpc.py) speaks binary over the same port, so
+    # it needs the buffer untouched — no ANSI stripping, no CRLF rewriting,
+    # no prompt trimming. These three are the whole escape hatch.
+
+    def write_raw(self, data: bytes) -> None:
+        """Write raw bytes verbatim — no encoding, no line terminator."""
+        self._ser.write(data)
+        self._ser.flush()
+
+    def take_raw(self) -> bytes:
+        """Pop everything buffered so far, unprocessed."""
+        return self._snapshot()
+
+    def drain(self) -> None:
+        """Discard anything buffered. Used to swallow CLI echo before RPC."""
+        self._drain()
+
+    def resync(self, timeout: float = 2.0) -> None:
+        """Return the CLI to a known state after raw/binary traffic."""
+        self._write("\r\n")
+        self._wait_quiet(timeout, quiet_ms=200)
+        self._drain()
+
     def write_file(
         self,
         path: str,
