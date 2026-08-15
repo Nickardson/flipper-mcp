@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import struct
 import zlib
+from contextlib import contextmanager
 
 import pytest
 
@@ -175,6 +176,13 @@ class FakeBridge:
         self._answer_ping = answer_ping
         self._answer_stream = answer_stream
         self.resynced = False
+        self.held = 0
+
+    @contextmanager
+    def hold(self):
+        """Records that the session pinned the port open, as the real one must."""
+        self.held += 1
+        yield
 
     def send(self, cmd: str, timeout: float = 10.0, quiet_ms: int = 300) -> str:
         return "app: Desktop" if cmd == "loader info" else ""

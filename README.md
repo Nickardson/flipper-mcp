@@ -309,12 +309,46 @@ export FLIPPER_DEFAULT_DEVICE=1
 
 Unset or `0` uses the Flipper's internal CC1101.
 
+## Sharing the port
+
+The serial handle is exclusive on Windows and macOS, so a long-running MCP
+server would otherwise lock qFlipper, the Flipper Lab web app, and
+`screen` / `tio` out of the device for as long as it lives.
+
+It doesn't. After **two minutes** with no traffic the server hands the port
+back to the OS and reopens it on the next tool call. The device is yours to
+use in between; nothing about the release is visible to a caller, since it can
+only happen between commands and never inside one.
+
+Two measured numbers, on Windows against a Flipper on `mntm-012`:
+
+- **Release lands 120–150s after the last command.** The sweep runs every
+  quarter of the timeout, so the port lingers up to one tick past the deadline
+  — 142s in a representative run.
+- **Reopening costs ~0.75s**, nearly all of it the handshake's quiet-period
+  wait. Only the first command after an idle stretch pays it.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `FLIPPER_IDLE_TIMEOUT` | `120` | Seconds of silence before the port is released. `0` holds it for the life of the process. |
+| `FLIPPER_PORT` | auto-detect | Pin an explicit device path, honoured on every reopen. |
+
+Raise it if you drive the Flipper in tight bursts and would rather not pay the
+handshake; set it to `0` if something in your setup dislikes the port coming
+and going.
+
+The connection also rebuilds itself when the device re-enumerates — a reboot,
+a replug, or a Sub-GHz app that resets USB. Before this, a re-enumeration left
+the cached handle stale and every tool failed until the server restarted.
+
 ## Troubleshooting
 
 **"Flipper port is busy — another app has it open"**
 Close the **Flipper Lab** tab in Chrome (`lab.flipper.net` uses Web Serial
 and takes an exclusive lock), quit qFlipper, or kill any `screen` / `tio`
-sessions on the port.
+sessions on the port. A second copy of this MCP server will do it too — note
+that a *running* server only holds the port while it is active, so this
+usually points at something other than an idle server.
 
 **"No Flipper Zero detected"**
 Plug in via USB-C (**data cable**, not charge-only), unlock the Flipper

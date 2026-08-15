@@ -12,91 +12,11 @@ be made to fail on demand, and auto-detection is stubbed out.
 
 from __future__ import annotations
 
-import time
-
 import pytest
-import serial
 
 from flipper_mcp import bridge as bridge_module
 from flipper_mcp.bridge import FlipperBridge, FlipperError
-
-
-class FakeSerial:
-    """A serial port whose writes fail until the handle is reopened.
-
-    ``failing`` models a handle that is stale from the outset. ``fail_after``
-    models one that goes stale partway through an operation: that many writes
-    succeed and every later one fails. Each instance is one *handle*, so a
-    reconnect produces a fresh one — exactly the state change the bridge is
-    supposed to bring about.
-    """
-
-    STALE = (
-        "WriteFile failed (PermissionError(13, "
-        "'The device does not recognize the command.', None, 22))"
-    )
-
-    def __init__(self, port, baudrate=115200, timeout=0.05, write_timeout=2.0):
-        self.port = port
-        self.timeout = timeout
-        self.written = bytearray()
-        self.failing = False
-        self.fail_after = None
-        self.closed = False
-        self.reply = b">: \r\n"
-        self._replied = False
-        self._writes = 0
-
-    def write(self, data: bytes) -> int:
-        if self.closed:
-            raise serial.SerialException("write on closed port")
-        self._writes += 1
-        if self.failing or (self.fail_after is not None and self._writes > self.fail_after):
-            raise serial.SerialException(self.STALE)
-        self.written.extend(data)
-        self._replied = False
-        return len(data)
-
-    def flush(self) -> None:
-        if self.failing:
-            raise serial.SerialException("flush failed")
-
-    def read(self, size: int = 1) -> bytes:
-        # One reply per write, so the quiet-period detector sees traffic and
-        # then silence rather than an endless stream. The empty-handed case
-        # blocks for the read timeout exactly as pyserial does — returning
-        # instantly would turn every reader thread into a hot spin, and the
-        # daemon threads of bridges a test leaves open never stop.
-        if self.closed:
-            raise serial.SerialException("read on closed port")
-        if self._replied:
-            time.sleep(self.timeout)
-            return b""
-        self._replied = True
-        return self.reply
-
-    def close(self) -> None:
-        self.closed = True
-
-
-@pytest.fixture
-def fake_ports(monkeypatch):
-    """Install FakeSerial and record every handle the bridge opens."""
-    handles: list[FakeSerial] = []
-
-    def factory(port, **kwargs):
-        handle = FakeSerial(port, **kwargs)
-        handles.append(handle)
-        return handle
-
-    monkeypatch.setattr(bridge_module.serial, "Serial", factory)
-    monkeypatch.setattr(FlipperBridge, "_auto_detect", staticmethod(lambda: "COM_TEST"))
-    yield handles
-    # Reader threads are daemons, so a bridge a test could not close (because
-    # the call under test raised) would otherwise keep polling for the rest of
-    # the session. Closing the handle ends its loop.
-    for handle in handles:
-        handle.close()
+from tests.conftest import FakeSerial
 
 
 # -- the stale handle ------------------------------------------------------

@@ -34,7 +34,8 @@ import re
 import sys
 import threading
 import time
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
 import serial
 from serial.tools import list_ports
@@ -42,9 +43,33 @@ from serial.tools import list_ports
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[=>]|\x1b\][^\x07]*\x07")
 PROMPT = ">:"
 
+# Seconds of silence after which the bridge hands the port back to the OS.
+# Set FLIPPER_IDLE_TIMEOUT=0 to keep it open for the life of the process.
+DEFAULT_IDLE_TIMEOUT = float(os.environ.get("FLIPPER_IDLE_TIMEOUT", "120"))
+
 
 class FlipperError(RuntimeError):
     pass
+
+
+def _is_busy(error: Exception) -> bool:
+    """Whether opening the port failed because someone else holds it.
+
+    pyserial reports this differently per platform and only ever as a message
+    string — macOS and Linux raise EBUSY ("Resource busy", errno 16), Windows
+    raises ERROR_ACCESS_DENIED, which surfaces as "Access is denied". Matching
+    only the POSIX wording, as an earlier version did, left Windows users
+    reading a raw ctypes error for the most common failure there.
+
+    This matters more now that the bridge parks the port when idle: sharing it
+    with qFlipper or the web app makes "someone else has it" an ordinary
+    outcome rather than a misconfiguration.
+    """
+    text = str(error)
+    return any(
+        marker in text
+        for marker in ("Resource busy", "Errno 16", "Access is denied", "PermissionError(13")
+    )
 
 
 class FlipperBridge:
@@ -60,6 +85,7 @@ class FlipperBridge:
         port: Optional[str] = None,
         baudrate: int = 115200,
         read_timeout: float = 0.05,
+        idle_timeout: Optional[float] = None,
     ) -> None:
         # Remember whether the port was pinned by the caller. On reconnect an
         # auto-detected port has to be detected again — Windows hands out a
@@ -67,13 +93,30 @@ class FlipperBridge:
         self._pinned_port = port
         self._baudrate = baudrate
         self._read_timeout = read_timeout
+        self._idle_timeout = (
+            DEFAULT_IDLE_TIMEOUT if idle_timeout is None else idle_timeout
+        )
         self._buf = bytearray()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
+        self._ser: Optional[serial.Serial] = None
+        # Reentrant: an operation holds this for its whole duration, and the
+        # calls nested inside it re-acquire freely. It is what makes the idle
+        # sweep safe — the port can only be dropped between operations.
+        self._state_lock = threading.RLock()
+        self._last_used = time.monotonic()
+        self._busy = 0
+        self._shutdown = threading.Event()
+        self._janitor: Optional[threading.Thread] = None
         self._open()
+        self._start_janitor()
 
     # -- connection ---------------------------------------------------------
+
+    @property
+    def connected(self) -> bool:
+        return self._ser is not None
 
     def _open(self) -> None:
         """Detect, open, and hand the port to a fresh reader thread."""
@@ -86,15 +129,13 @@ class FlipperBridge:
                 write_timeout=2.0,
             )
         except serial.SerialException as e:
-            # Errno 16 (EBUSY) on macOS almost always means Chrome's Web Serial
-            # API (lab.flipper.net) or qFlipper has the port open. Give the
-            # caller an actionable fix, not a stack trace.
-            if "Resource busy" in str(e) or "Errno 16" in str(e):
+            if _is_busy(e):
                 raise FlipperError(
                     f"Flipper port {self.port} is busy — another app has it open. "
                     "Common culprits: the 'Flipper Lab' tab in Chrome "
-                    "(lab.flipper.net), qFlipper, or an open `screen`/`tio` "
-                    "session. Close it and retry."
+                    "(lab.flipper.net), qFlipper, an open `screen`/`tio` "
+                    "session, or a second copy of this MCP server. Close it "
+                    "and retry."
                 ) from e
             raise FlipperError(f"Could not open {self.port}: {e}") from e
         self._stop.clear()
@@ -114,12 +155,10 @@ class FlipperBridge:
             # promptly. Joining matters: two reader threads appending to the
             # same buffer would interleave old and new bytes.
             reader.join(timeout=2.0)
+        handle, self._ser = self._ser, None
         try:
-            # getattr, not attribute access: a bridge whose very first _open()
-            # failed before binding the handle still has to tear down cleanly.
-            port = getattr(self, "_ser", None)
-            if port is not None:
-                port.close()
+            if handle is not None:
+                handle.close()
         except Exception:
             pass
 
@@ -131,8 +170,100 @@ class FlipperBridge:
         inside an RPC session, where it would drop the CLI back in front of a
         caller still speaking protobuf.
         """
-        self._teardown()
-        self._open()
+        with self._state_lock:
+            self._teardown()
+            self._open()
+
+    def _ensure_open(self) -> None:
+        """Reopen if the port was released, or if the connection went bad."""
+        with self._state_lock:
+            if self._ser is None:
+                self._open()
+            elif self._reader is None or not self._reader.is_alive():
+                # A dead reader means the port failed on the read side — the
+                # loop exits on error and never comes back. Writes can still
+                # succeed against such a handle, which would strand the caller
+                # waiting on a quiet period nobody is filling any more.
+                self.reconnect()
+
+    # -- idle release -------------------------------------------------------
+    #
+    # Holding the port open forever is antisocial: it is an exclusive handle on
+    # Windows and macOS, so a parked MCP server locks qFlipper, the Flipper Lab
+    # web app, and `screen`/`tio` out of the device for as long as it runs. The
+    # connection is cheap to rebuild — detect, open, handshake, measured at
+    # ~0.75s on Windows — so a bridge that has gone quiet drops the port and
+    # reopens on the next command, which is the only one that pays.
+
+    @contextmanager
+    def _operation(self) -> Iterator[None]:
+        """Hold the connection open for the whole of one operation.
+
+        The port can only be reclaimed while this is not held, so no command
+        can have it pulled out from under it midway.
+        """
+        with self._state_lock:
+            self._ensure_open()
+            self._busy += 1
+            try:
+                yield
+            finally:
+                self._busy -= 1
+                self._last_used = time.monotonic()
+
+    @contextmanager
+    def hold(self) -> Iterator[None]:
+        """Keep the port open across a sequence of calls.
+
+        Needed by anything that spans more than one bridge call and cannot
+        survive a reconnect in the middle — an RPC session above all, where a
+        reopened port would land the CLI in front of a caller still writing
+        protobuf.
+        """
+        with self._operation():
+            yield
+
+    def _start_janitor(self) -> None:
+        if self._idle_timeout <= 0:
+            return  # explicitly disabled: hold the port for the whole session
+        self._janitor = threading.Thread(
+            target=self._janitor_loop, name="flipper-janitor", daemon=True
+        )
+        self._janitor.start()
+
+    def _janitor_loop(self) -> None:
+        # Quarter of the timeout bounds how long past the deadline the port can
+        # linger, without waking often enough to matter. The floor only comes
+        # into play for the very short timeouts the tests use.
+        tick = max(0.25, self._idle_timeout / 4)
+        while not self._shutdown.wait(tick):
+            self.release_if_idle()
+
+    def release_if_idle(self) -> bool:
+        """Drop the port if nothing has used it for ``idle_timeout``.
+
+        Returns whether the port was released. Never waits on a busy bridge:
+        an operation in flight is itself proof the bridge is not idle, so the
+        sweep skips this round rather than queueing behind it.
+        """
+        if self._idle_timeout <= 0:
+            return False
+        if not self._state_lock.acquire(blocking=False):
+            return False
+        try:
+            # The lock alone would not settle this. It is reentrant, so a
+            # caller that reached here from inside its own operation would
+            # acquire it happily and release the port under itself. `_busy`
+            # states the invariant outright instead of leaning on which thread
+            # happens to be asking.
+            if self._busy or self._ser is None:
+                return False
+            if time.monotonic() - self._last_used < self._idle_timeout:
+                return False
+            self._teardown()
+            return True
+        finally:
+            self._state_lock.release()
 
     # -- discovery ----------------------------------------------------------
 
@@ -213,13 +344,12 @@ class FlipperBridge:
     # mode. First writes carry no such history, so those are the ones marked.
 
     def _raw_write(self, data: bytes, allow_reconnect: bool) -> None:
-        # A dead reader thread means the port failed on the read side — it
-        # exits its loop on error and never comes back. Writes can still
-        # succeed against such a handle, which would strand the caller waiting
-        # on a quiet period that no longer has anyone filling the buffer, so
-        # check before writing rather than after.
-        if allow_reconnect and self._reader is not None and not self._reader.is_alive():
-            self.reconnect()
+        if self._ser is None:
+            # Only reachable if a caller reaches past the public API; every
+            # operation opens the port before writing a byte.
+            raise FlipperError(
+                f"No open connection to the Flipper on {self.port}."
+            )
         try:
             self._ser.write(data)
             self._ser.flush()
@@ -306,7 +436,9 @@ class FlipperBridge:
         self._drain()
 
     def close(self) -> None:
-        self._teardown()
+        self._shutdown.set()  # stop the idle sweep before dropping the port
+        with self._state_lock:
+            self._teardown()
 
     def __enter__(self) -> "FlipperBridge":
         return self
@@ -318,10 +450,11 @@ class FlipperBridge:
 
     def send(self, cmd: str, timeout: float = 10.0, quiet_ms: int = 300) -> str:
         """Run a one-shot command, return cleaned output once it settles."""
-        self._drain()
-        self._write(cmd + "\r\n", allow_reconnect=True)
-        self._wait_quiet(timeout, quiet_ms)
-        return self._clean(self._snapshot(), cmd)
+        with self._operation():
+            self._drain()
+            self._write(cmd + "\r\n", allow_reconnect=True)
+            self._wait_quiet(timeout, quiet_ms)
+            return self._clean(self._snapshot(), cmd)
 
     def stream(
         self,
@@ -331,12 +464,13 @@ class FlipperBridge:
         quiet_ms: int = 300,
     ) -> str:
         """Run a streaming command for `duration` seconds, Ctrl-C, return output."""
-        self._drain()
-        self._write(cmd + "\r\n", allow_reconnect=True)
-        time.sleep(duration)
-        self._write("\x03")  # Ctrl-C
-        self._wait_quiet(post_timeout, quiet_ms)
-        return self._clean(self._snapshot(), cmd)
+        with self._operation():
+            self._drain()
+            self._write(cmd + "\r\n", allow_reconnect=True)
+            time.sleep(duration)
+            self._write("\x03")  # Ctrl-C
+            self._wait_quiet(post_timeout, quiet_ms)
+            return self._clean(self._snapshot(), cmd)
 
     def interrupt(self) -> str:
         """Send a lone Ctrl-C to recover from a stuck streaming command.
@@ -346,10 +480,11 @@ class FlipperBridge:
         terminating Ctrl-C). Returns whatever output the CLI emits while
         closing out.
         """
-        self._drain()
-        self._write("\x03", allow_reconnect=True)
-        self._wait_quiet(timeout=2.0, quiet_ms=200)
-        return self._clean(self._snapshot())
+        with self._operation():
+            self._drain()
+            self._write("\x03", allow_reconnect=True)
+            self._wait_quiet(timeout=2.0, quiet_ms=200)
+            return self._clean(self._snapshot())
 
     # -- raw binary access --------------------------------------------------
     #
@@ -376,9 +511,10 @@ class FlipperBridge:
 
     def resync(self, timeout: float = 2.0) -> None:
         """Return the CLI to a known state after raw/binary traffic."""
-        self._write("\r\n", allow_reconnect=True)
-        self._wait_quiet(timeout, quiet_ms=200)
-        self._drain()
+        with self._operation():
+            self._write("\r\n", allow_reconnect=True)
+            self._wait_quiet(timeout, quiet_ms=200)
+            self._drain()
 
     def write_file(
         self,
@@ -391,16 +527,17 @@ class FlipperBridge:
         Uses ``storage write <path>`` which reads stdin until Ctrl-C. Small
         text files only — not suitable for binary payloads or large files.
         """
-        self._drain()
-        self._write(f"storage write {path}\r\n", allow_reconnect=True)
-        # Give the Flipper a moment to open the file and start reading
-        time.sleep(0.3)
-        self._write(content)
-        if not content.endswith("\n"):
-            self._write("\n")
-        self._write("\x03")  # end write session
-        self._wait_quiet(timeout=end_timeout, quiet_ms=300)
-        return self._clean(self._snapshot())
+        with self._operation():
+            self._drain()
+            self._write(f"storage write {path}\r\n", allow_reconnect=True)
+            # Give the Flipper a moment to open the file and start reading
+            time.sleep(0.3)
+            self._write(content)
+            if not content.endswith("\n"):
+                self._write("\n")
+            self._write("\x03")  # end write session
+            self._wait_quiet(timeout=end_timeout, quiet_ms=300)
+            return self._clean(self._snapshot())
 
 
 # ---------------------------------------------------------------------------

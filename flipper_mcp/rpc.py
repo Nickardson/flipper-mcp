@@ -204,29 +204,37 @@ def rpc_session(
     leaked session would leave every other tool talking protobuf at a parser
     that expects ANSI text.
     """
-    bridge.drain()
-    # Carriage return ONLY. The device switches to protobuf the instant it sees
-    # the terminator, so a trailing newline would land in the binary stream,
-    # where 0x0A reads as "next message is 10 bytes long" and eats the head of
-    # the first real request. This costs an afternoon if you get it wrong.
-    # This is the one write in the session that may reconnect: nothing has been
-    # sent yet, so a handle left stale by an earlier reboot or replug can be
-    # rebuilt here without corrupting anything. Every later write is a protobuf
-    # request that only means something to a device already in RPC mode.
-    bridge.write_raw(b"start_rpc_session\r", allow_reconnect=True)
-    # The CLI echoes the command and emits its last prompt before the switch.
-    _settle(bridge)
-    channel = RpcChannel(bridge)
-    try:
-        channel.handshake(timeout=handshake_timeout)
-        yield channel
-    finally:
+    # `hold` pins the port for the whole session. That matters for more than
+    # tidiness: the bridge reclaims an idle port between operations, and a
+    # session is a run of raw writes it cannot see inside. Reopening midway
+    # would hand the CLI back to a caller still speaking protobuf.
+    with bridge.hold():
+        bridge.drain()
+        # Carriage return ONLY. The device switches to protobuf the instant it
+        # sees the terminator, so a trailing newline would land in the binary
+        # stream, where 0x0A reads as "next message is 10 bytes long" and eats
+        # the head of the first real request. This costs an afternoon if you
+        # get it wrong.
+        #
+        # This is also the one write in the session that may reconnect: nothing
+        # has been sent yet, so a handle left stale by an earlier reboot or
+        # replug can be rebuilt here without corrupting anything. Every later
+        # write is a protobuf request that only means something to a device
+        # already in RPC mode.
+        bridge.write_raw(b"start_rpc_session\r", allow_reconnect=True)
+        # The CLI echoes the command and emits its last prompt before the switch.
+        _settle(bridge)
+        channel = RpcChannel(bridge)
         try:
-            channel.send(FIELD_STOP_SESSION)
-            time.sleep(0.2)
-        except Exception:
-            pass
-        bridge.resync()
+            channel.handshake(timeout=handshake_timeout)
+            yield channel
+        finally:
+            try:
+                channel.send(FIELD_STOP_SESSION)
+                time.sleep(0.2)
+            except Exception:
+                pass
+            bridge.resync()
 
 
 class RpcChannel:
