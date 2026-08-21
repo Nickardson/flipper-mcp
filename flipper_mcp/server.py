@@ -14,10 +14,11 @@ the server run without a Flipper attached.
 from __future__ import annotations
 
 import atexit
+import json
 import os
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import Image, MCPServer
 
 from .bridge import FlipperBridge
 from .registry import (
@@ -31,6 +32,7 @@ from .registry import (
     uninstall_from_cache,
     user_cache_dir,
 )
+from .screen import capture as capture_screen
 from .ui import (
     close_any_running_app,
     hold_key,
@@ -41,7 +43,7 @@ from .ui import (
     subghz_read_start_ui,
 )
 
-mcp = FastMCP("flipper")
+mcp = MCPServer("flipper")
 
 # Per-user default radio device for SubGHz commands.
 #   0 = internal CC1101 (default for everyone without an add-on)
@@ -524,6 +526,43 @@ def flipper_input_sequence(sequence: str, step_delay_s: float = 0.05) -> list[st
     down, holds OK, waits 300 ms, then backs out.
     """
     return run_sequence(_get_bridge(), sequence, step_delay_s=step_delay_s)
+
+
+# -- screen capture (v0.6) -------------------------------------------------
+
+
+@mcp.tool(structured_output=False)
+def flipper_screen(scale: int = 4, timeout_s: float = 3.0) -> list:
+    """Capture the Flipper's screen as a PNG, plus a state envelope.
+
+    Use this to verify the device actually reached the UI state you drove it
+    to with ``flipper_press_key`` / ``flipper_input_sequence``.
+
+    Returns two blocks:
+      - the screen as an image, upscaled by ``scale`` (default 4)
+      - JSON with ``app`` (foreground app per ``loader info``), ``orientation``,
+        the image's ``width``/``height``, and two digests.
+
+    The panel is 128x64, but an app running in a vertical orientation is
+    rotated upright for you and comes back 64x128. Take the dimensions from
+    the envelope rather than assuming landscape.
+
+    On the digests: assert on ``body_sha256``, which covers the rows below the
+    status bar. ``frame_sha256`` includes the clock and battery indicators, so
+    it changes on its own and is only useful as a "did anything move?" signal.
+
+    Both digests only identify screens that hold still. Screens with an
+    animated icon or a marquee-scrolling label — including the selected tile
+    in the app grid — differ on every capture, so read the image instead.
+
+    Note this briefly switches the device into protobuf RPC mode, during which
+    no other tool can talk to it. The session is always closed before returning.
+    """
+    result = capture_screen(_get_bridge(), scale=scale, timeout=timeout_s)
+    return [
+        Image(data=result["png"], format="png"),
+        json.dumps(result["envelope"], indent=2),
+    ]
 
 
 # -- workflow macros (v0.5) ------------------------------------------------

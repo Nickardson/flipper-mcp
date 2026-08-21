@@ -151,6 +151,60 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | `ir_universal_list(category)` | List built-in universal-remote buttons (tv/audio/ac/fan) |
 | `ir_universal_send(category, button)` | Transmit a universal-remote button from the firmware's DB |
 
+### Screen capture (v0.6)
+| Tool | Purpose |
+|---|---|
+| `flipper_screen(scale, timeout_s)` | Capture the screen as a PNG plus a state envelope (128x64, or 64x128 for vertical apps) |
+
+The Flipper CLI has no screenshot command, so this tool briefly switches the
+device into protobuf RPC mode (the same channel
+[lab.flipper.net](https://lab.flipper.net) uses), pulls one frame, and switches
+back. **No other tool can talk to the device while that session is open** — it
+is always closed before the tool returns, including on error.
+
+Alongside the image you get a JSON envelope:
+
+```json
+{
+  "app": "Desktop",
+  "width": 128, "height": 64, "scale": 4,
+  "orientation": "horizontal",
+  "body_sha256": "…",
+  "frame_sha256": "…",
+  "text": null
+}
+```
+
+**`body_sha256`** covers the pixel rows below the status bar; `frame_sha256`
+covers the whole screen including the clock, battery and Bluetooth icons, which
+change on their own schedule. Assert on the former, use the latter only as a
+"did anything move?" signal.
+
+**Vertical apps are rotated for you.** The device always transmits the raw
+128x64 panel, whatever orientation the running app asked for, so a vertical
+app's frame arrives lying on its side. It is turned clockwise into a 64x128
+portrait image before encoding — verified against the Infrared editor on
+`mntm-012`. `width` and `height` describe the *image*, so read your expected
+dimensions off the envelope rather than assuming 128x64.
+
+One wrinkle: vertical apps appear to draw no status bar, so the 13-row crop
+costs `body_sha256` a little real content there. That is the deliberate
+direction to be wrong — the digest's whole contract is that it holds still.
+
+**Digests only identify screens that hold still.** Verified on Momentum
+`mntm-012`: two captures of a settled screen are byte-identical, but the app
+grid marquee-scrolls the label of the *selected* tile and animates its icon, so
+those frames differ every capture. For animated screens the image is the
+reliable check — read it, don't hash it. A settle-and-retry helper would close
+this gap if it turns out to matter in practice.
+
+The status-bar crop is row-exact (`STATUS_BAR_ROWS`, 13) rather than aligned to
+the 8-row byte pages, because a desktop capture shows the bar extending past
+row 8 — a page-aligned crop left the bottom of the clock digits inside the
+"stable" digest, where it would have changed every minute.
+
+`text` is reserved for bitmap-font OCR.
+
 ### Physical
 | Tool | Purpose |
 |---|---|
@@ -266,12 +320,46 @@ export FLIPPER_DEFAULT_DEVICE=1
 
 Unset or `0` uses the Flipper's internal CC1101.
 
+## Sharing the port
+
+The serial handle is exclusive on Windows and macOS, so a long-running MCP
+server would otherwise lock qFlipper, the Flipper Lab web app, and
+`screen` / `tio` out of the device for as long as it lives.
+
+It doesn't. After **two minutes** with no traffic the server hands the port
+back to the OS and reopens it on the next tool call. The device is yours to
+use in between; nothing about the release is visible to a caller, since it can
+only happen between commands and never inside one.
+
+Two measured numbers, on Windows against a Flipper on `mntm-012`:
+
+- **Release lands 120–150s after the last command.** The sweep runs every
+  quarter of the timeout, so the port lingers up to one tick past the deadline
+  — 142s in a representative run.
+- **Reopening costs ~0.75s**, nearly all of it the handshake's quiet-period
+  wait. Only the first command after an idle stretch pays it.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `FLIPPER_IDLE_TIMEOUT` | `120` | Seconds of silence before the port is released. `0` holds it for the life of the process. |
+| `FLIPPER_PORT` | auto-detect | Pin an explicit device path, honoured on every reopen. |
+
+Raise it if you drive the Flipper in tight bursts and would rather not pay the
+handshake; set it to `0` if something in your setup dislikes the port coming
+and going.
+
+The connection also rebuilds itself when the device re-enumerates — a reboot,
+a replug, or a Sub-GHz app that resets USB. Before this, a re-enumeration left
+the cached handle stale and every tool failed until the server restarted.
+
 ## Troubleshooting
 
 **"Flipper port is busy — another app has it open"**
 Close the **Flipper Lab** tab in Chrome (`lab.flipper.net` uses Web Serial
 and takes an exclusive lock), quit qFlipper, or kill any `screen` / `tio`
-sessions on the port.
+sessions on the port. A second copy of this MCP server will do it too — note
+that a *running* server only holds the port while it is active, so this
+usually points at something other than an idle server.
 
 **"No Flipper Zero detected"**
 Plug in via USB-C (**data cable**, not charge-only), unlock the Flipper
